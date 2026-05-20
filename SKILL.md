@@ -1,6 +1,6 @@
 ---
 name: notion-mcp-playbook
-description: "Read this skill before calling any Notion MCP tool. Covers behaviors not in the connector docs that cause silent wrong behaviour or confusing errors. Reading costs less than retrying after a failed call."
+description: "Use before calling any notion-* MCP tool, or when editing Notion pages with CJK content. Covers undocumented quirks: DDL parser limits, write-format ≠ read-format, timeout handling, code-point failures in update_content."
 ---
 
 # Notion MCP implementation guide
@@ -8,6 +8,21 @@ description: "Read this skill before calling any Notion MCP tool. Covers behavio
 This skill captures Notion MCP tool quirks that cause silent wrong behaviour or confusing errors. Each section describes the quirk, why it happens, and the working pattern.
 
 This skill covers only Notion MCP tool mechanics. It does not prescribe how to organize your content (page structure, indexing, naming) — those are yours to decide.
+
+## Quick Reference
+
+| Intent | Tool & key constraint | Section |
+|---|---|---|
+| Create database | `notion-create-database`; no `(` `)` in option names; STATUS → SELECT | §1 |
+| Add database rows | `notion-create-pages`; parent = `data_source_id`; multi-select = JSON string | §3, §6.1 |
+| Inspect database schema | `notion-fetch` on `collection://` URL | §6.1 |
+| Small text edit on a page | `notion-update-page` `update_content`; `old_str` copied verbatim from fetch | §7.3 |
+| Large rewrite of a page | `notion-update-page` `replace_content`; carry child tags | §7, §7.2 |
+| Update properties only | `notion-update-page` `update_properties`; `content_updates = []` | §6.3 |
+| Enumerate all rows in a database | NOT search; multiple targeted `data_source_url` searches | §4.2 |
+| Inline link to another page | Markdown link syntax, NOT `<page url="...">` | §2.1 |
+
+For error-driven lookup (you have a symptom), see §9 Error triage. For tool-by-tool last checks before calling, see §10 pre-flight.
 
 ## 1. DDL parser limits (creating databases)
 
@@ -70,9 +85,9 @@ Treat anything in angle brackets that came from a fetch as render-output unless 
 Multi-select properties are written as a **JSON array string**, not as a literal array.
 
 ```
-properties: {
-  "Tags": "[\"Option A\", \"Option B, with comma\"]"
-}
+GOOD: properties: { "Tags": "[\"Option A\", \"Option B, with comma\"]" }
+BAD:  properties: { "Tags": ["Option A", "Option B"] }              // literal array; connector expects a string
+BAD:  properties: { "Tags": "Option A, Option B" }                  // comma-joined; breaks on option names containing commas
 ```
 
 Notion parses the string as JSON. This format survives option names containing commas, brackets, or other characters that would break a comma-joined string. After write, `notion-fetch` returns the property as a real array `["Option A", "Option B, with comma"]` — read-format ≠ write-format strikes again.
@@ -135,13 +150,35 @@ This catches data errors before they hit the API and creates an audit trail of w
 
 The `content_updates` parameter is required by the schema even when you're not changing content. Pass `[]`.
 
-### 6.4 Verify after batch writes
+```
+GOOD: { "command": "update_properties", "properties": {...}, "content_updates": [] }
+BAD:  { "command": "update_properties", "properties": {...} }       // content_updates omitted; schema rejects
+```
 
-After modifying multiple rows, fetch a random sample (2-3 rows) to confirm the writes took effect. The `as of <timestamp>` in the fetch result is a snapshot time — in extreme cases a fetch immediately after a write might show stale data. If verification fails, wait a few seconds and re-fetch before assuming the write failed.
+### 6.4 Write verification loop
+
+Required after any of: batch writes (>5 rows), `replace_content`, `update_content` after timeout.
+
+1. Fetch a representative sample:
+   - Batch writes: 2-3 random rows
+   - `replace_content`: the whole page
+   - `update_content` after timeout: just the affected section
+2. Compare against intended state. Note: the `as of <timestamp>` in fetch output is a snapshot — in rare cases a fetch immediately after a write shows stale data.
+3. If verification fails: wait briefly and refetch once more before retrying the write (rules out snapshot staleness).
+4. **Stop after one retry cycle** unless the error pattern changes between attempts. Repeated identical failures mean the write is genuinely broken (schema mismatch, code-point issue, permission), not stale snapshots. Re-reading docs or asking the user is more productive than further retries.
 
 ## 7. Content commands (`update_content` / `replace_content`)
 
-Behaviors around the content commands that repeatedly cause wasted retries.
+Picking the wrong command from the start is the most common cause of wasted retries in this connector. Decide before writing:
+
+| Situation | Use | Reason |
+|---|---|---|
+| Local edit, page stays mostly intact | `update_content` | Targeted, low risk |
+| Large rewrite (~30%+ of page changes) | `replace_content` | Simpler backend; more reliable on large payloads |
+| Bulk cleanup across multiple non-adjacent sections | `replace_content` | Stacked `update_content` chains compound the code-point risk in §7.3 |
+| `replace_content` on a parent page with children | `replace_content` + carry child tags into `new_str` | See §7.2 |
+
+`update_content` is for local, well-targeted edits with an unambiguous `old_str`. Chaining 7+ `update_content` calls to delete sections that would fit in one `replace_content` rewrite is a smell — each call has overhead and adds one more chance for a Han variant code-point mismatch (§7.3) anywhere in the chain.
 
 ### 7.1 Timeout ≠ failure
 
@@ -149,18 +186,9 @@ Large-payload writes (especially `update_content`) often return `notionhq_client
 
 **Rule**: after any timeout, fetch first to verify the actual state. Only retry if fetch confirms the write did not land. Retrying without verifying causes duplicate writes.
 
-### 7.2 Prefer `replace_content` for large rewrites — but watch child pages
+### 7.2 `replace_content` and child pages
 
-`replace_content` is a whole-page overwrite — simpler backend logic than `update_content`'s search-and-replace, and more reliable on large payloads. When `update_content` repeatedly times out, also consider switching to `replace_content`.
-
-Caveat on any parent page with children: child pages/databases are structural (§5.1), not part of the fetched markdown, so they are easy to forget. `replace_content` errors rather than silently dropping them. To keep them, include the child `<page url="...">` / `<database url="...">` tags in `new_str`; to drop them, set `allow_deleting_content`. So before a `replace_content` on a parent page, fetch first and carry every child tag into `new_str` verbatim.
-
-**Additional trigger: bulk deletion or multi-section cleanup.** When the intended change involves removing roughly 30%+ of a page's content, or cleaning up multiple non-adjacent sections in the same operation, prefer `replace_content` over stacked `update_content` calls from the start — not as a retry after the stacking fails. `update_content` is for local, well-targeted edits with an unambiguous `old_str` and a bounded change. Chaining 7+ `update_content` calls to delete sections that would fit in one `replace_content` rewrite is a smell: each call has overhead and increases the chance of a Han variant code-point mismatch (§7.3) somewhere in the chain.
-
-Decision pointer for picking between the two from the start:
-
-- Local edit, page stays mostly intact → `update_content`
-- Large rewrite or bulk cleanup → `replace_content` (carry child tags per the caveat above)
+Child pages/databases are structural (§5.1), not part of the fetched markdown, so they are easy to forget on a parent page. `replace_content` errors rather than silently dropping them. To keep them, include the child `<page url="...">` / `<database url="...">` tags in `new_str`; to drop them, set `allow_deleting_content`. Before a `replace_content` on a parent page, fetch first and carry every child tag into `new_str` verbatim.
 
 ### 7.3 `update_content` old_str must be copied verbatim from fetch
 
@@ -176,7 +204,22 @@ Building a database from scratch involves many turns: parent page, child page, s
 
 **Pattern**: at the start of each new stage, give the user a one-line summary of what completed in the previous stage and what the next stage will do. This costs almost nothing and prevents the user from losing the thread when they're reviewing a session days later.
 
-## 9. Quick-reference: pre-flight checks before each tool call
+## 9. Error triage
+
+When a Notion MCP call fails or behaves unexpectedly, check this table first before re-reading docs or guessing.
+
+| Symptom | Most likely cause | First action |
+|---|---|---|
+| `Expected column name in double quotes, got "("` | Option name contains `(` | §1.1 — replace `()` with `[]` or `-` |
+| STATUS create rejects inline options | DDL parser does not accept options for STATUS | §1.2 — use SELECT or empty STATUS |
+| `validation_error: No matches found` on `update_content` | Han variant code-point mismatch in `old_str` | §7.3 — refetch and copy verbatim |
+| `notionhq_client_request_timeout` | Gateway timeout; write may have succeeded | §7.1 — fetch before retrying |
+| Multi-select write rejected | Option name not in schema, or literal array instead of JSON string | §3 |
+| Properties unchanged after `update_properties` | `content_updates` missing `[]`, or property name typo | §6.3 |
+| Child page block reappears at top of page after edit | Auto-rendered from parent-child relationship | §5.1 — not removable via content edit |
+| `<page url="...">` written inline ends up at top of page | Notion re-parses tag as child page reference | §2.1 — use markdown link syntax |
+
+## 10. Quick-reference: pre-flight checks before each tool call
 
 Before calling, verify:
 
