@@ -1,6 +1,6 @@
 ---
 name: notion-mcp-playbook
-description: "Use before calling any notion-* MCP tool, or when editing Notion pages with CJK content. Covers undocumented quirks: DDL parser limits, write-format ≠ read-format, timeout handling, code-point failures in update_content."
+description: "Use before calling any notion-* MCP tool, or when editing Notion pages with CJK content. Covers undocumented quirks: DDL parser limits, write-format ≠ read-format, timeout handling, fetch staleness across turns, code-point failures in update_content."
 ---
 
 # Notion MCP implementation guide
@@ -19,10 +19,10 @@ This skill covers only Notion MCP tool mechanics. It does not prescribe how to o
 | Small text edit on a page | `notion-update-page` `update_content`; `old_str` copied verbatim from fetch | §7.3 |
 | Large rewrite of a page | `notion-update-page` `replace_content`; carry child tags | §7, §7.2 |
 | Update properties only | `notion-update-page` `update_properties`; `content_updates = []` | §6.3 |
-| Enumerate all rows in a database | NOT search; multiple targeted `data_source_url` searches | §4.2 |
+| Enumerate all rows in a database | No reliable mechanism; use targeted `data_source_url` searches and accept incompleteness | §4 |
 | Inline link to another page | Markdown link syntax, NOT `<page url="...">` | §2.1 |
 
-For error-driven lookup (you have a symptom), see §9 Error triage. For tool-by-tool last checks before calling, see §10 pre-flight.
+For error-driven lookup (you have a symptom), see §8 Error triage. For tool-by-tool last checks before calling, see §9 pre-flight.
 
 ## 1. DDL parser limits (creating databases)
 
@@ -75,10 +75,13 @@ This stays as inline text where you wrote it.
 
 Treat anything in angle brackets that came from a fetch as render-output unless explicitly documented as write-input. The two that actually get misused as write input: `<ancestor-path>` (page hierarchy, computed from parent relationships) and `<data-source url="collection://...">` (data-source binding, set at create time — not settable by writing the tag).
 
-### 2.3 Other read-format quirks
+### 2.3 Code blocks without a language get auto-detected
 
-- `<details>` toggle inner content is prefixed with `\t` in fetch output. This is a storage artifact, not a content change — don't misread it as drift from your last write.
-- Code blocks without an explicit language are auto-detected by Notion (observed: detected as javascript). For plain text content, write ` ```text ` or ` ```plain ` explicitly to avoid wrong syntax highlighting.
+Notion auto-detects the language of code blocks that have no explicit fence language (observed: detected as javascript). For plain-text content, write `` ```text `` or `` ```plain `` explicitly to avoid wrong syntax highlighting.
+
+### 2.4 `<details>` toggle artifact
+
+`<details>` toggle inner content is prefixed with `\t` in fetch output. This is a storage artifact, not a content change — don't misread it as drift from your last write.
 
 ## 3. Multi-select write payload
 
@@ -96,21 +99,16 @@ If the option name does not exist in the schema, the write fails. Always cross-c
 
 ## 4. Search and listing limits
 
-### 4.1 Page size cap, and no usable pagination
+`notion-search` caps `page_size` at 25 and exposes **no pagination parameter** in the tool schema — no cursor, offset, or page token. Whether the backend returns a continuation token in practice is unverified. Treat search as un-paginatable.
 
-`notion-search` caps `page_size` at 25. The non-obvious part: the tool schema exposes **no pagination parameter** — no cursor, offset, or page token. Whether the backend returns a continuation token in practice is unverified. Treat search as un-paginatable; widen coverage with multiple targeted queries instead (see §4.2).
-
-### 4.2 Search is for finding, not listing
-
-Search ranks by semantic relevance. It is **not** the right tool to "list every row in a database". For full enumeration:
+Search also ranks by semantic relevance, so it is **not** the right tool to "list every row in a database". For full enumeration:
 
 - `notion-fetch` on a `collection://` URL returns the schema and SQLite definition but not the rows.
-- This connector does **not** expose a `query_data_sources` tool, even though other tool descriptions reference it. Do not attempt to call it. The only row-reaching mechanism is `notion-search` with `data_source_url` set to the `collection://` URL — still relevance-ranked, still capped at 25.
-- Run multiple targeted `data_source_url`-scoped searches with different queries to cover the row space. Full enumeration of a large database is not guaranteed.
+- This connector does **not** expose a `query_data_sources` tool, even though other tool descriptions reference it. Do not attempt to call it.
+- The only row-reaching mechanism is `notion-search` with `data_source_url` set to the `collection://` URL — still relevance-ranked, still capped at 25.
+- Run multiple targeted `data_source_url`-scoped searches with different queries to widen coverage. Full enumeration of a large database is not guaranteed; tell the user when results are likely incomplete rather than implying a full list.
 
 ## 5. Parent-child relationships
-
-### 5.1 Child page blocks are auto-rendered, not maintained by you
 
 When a child page exists under a parent, Notion automatically renders a child page block at the top of the parent. You did not write it — Notion did. You cannot remove it via `notion-update-page` content edits because it is not part of the page's markdown content; it is rendered from the parent-child structural relationship.
 
@@ -118,11 +116,8 @@ When a child page exists under a parent, Notion automatically renders a child pa
 
 - To remove the child page block, delete (or move) the child page itself.
 - The child page block appears in fetch output as `<page url="...">Title</page>` — see §2.1.
-- This means parent pages always show their children at the top, even if you maintain a separate manual index lower in the page. The auto-block and the manual index can coexist.
-
-### 5.2 Database row pages cannot be moved out of the database
-
-A database row page's parent is the data source. Moving it out via `notion-move-pages` would detach it from the database. Don't attempt this when "cleaning up" workspace clutter — the rows are not clutter, they are data.
+- Parent pages always show their children at the top, even if you maintain a separate manual index lower in the page. The auto-block and the manual index can coexist.
+- A database row page's parent is the data source. Moving it out via `notion-move-pages` detaches it from the database — don't do this when "cleaning up" workspace clutter; the rows are not clutter, they are data.
 
 ## 6. Update workflow patterns
 
@@ -155,7 +150,25 @@ GOOD: { "command": "update_properties", "properties": {...}, "content_updates": 
 BAD:  { "command": "update_properties", "properties": {...} }       // content_updates omitted; schema rejects
 ```
 
-### 6.4 Write verification loop
+### 6.4 Pre-write freshness check (re-fetch before update)
+
+`notion-update-page` with `update_content` uses `old_str` to locate the edit point. A successful match does not mean the write lands in the position the user expects. If the user edited the page in the Notion app between your fetch and your write, `old_str` still matches (the old content was not removed), but the surrounding context has shifted — the result is duplicated content on the page rather than an in-place update.
+
+This failure is silent: fetch succeeds, write succeeds, no error, no timeout. §6.5 (post-write verification) only catches it after the fact; §7.1 / §7.3 do not cover it.
+
+**Re-fetch before writing if any of these is true**:
+
+- Fetch's `as of <timestamp>` is more than ~5 minutes old.
+- A user turn has elapsed since the fetch (each turn is an opportunity for the user to edit in the Notion app).
+- The target is a heavy-edit page (handover docs, shared planning pages, view-spec roots). For these, treat any crossed turn as a trigger.
+
+Cold pages (append-only logs, archives, pages you just created in this session) do not need this — the re-fetch cost is not worth it.
+
+The authoritative timestamp is the `as of YYYY-MM-DDTHH:MM:SSZ` line at the top of fetch output. Don't estimate from conversation context.
+
+Trade-off: one extra fetch call per write. But the duplication recovery path (fetch → diagnose → second update to remove the wrong copy → verify) costs 3+ tool calls and leaves an incident trail in the conversation, which is materially more expensive.
+
+### 6.5 Write verification loop
 
 Required after any of: batch writes (>5 rows), `replace_content`, `update_content` after timeout.
 
@@ -175,10 +188,10 @@ Picking the wrong command from the start is the most common cause of wasted retr
 |---|---|---|
 | Local edit, page stays mostly intact | `update_content` | Targeted, low risk |
 | Large rewrite (~30%+ of page changes) | `replace_content` | Simpler backend; more reliable on large payloads |
-| Bulk cleanup across multiple non-adjacent sections | `replace_content` | Stacked `update_content` chains compound the code-point risk in §7.3 |
+| Bulk cleanup across multiple non-adjacent CJK sections | `replace_content` | Stacked `update_content` chains compound the code-point risk in §7.3 |
 | `replace_content` on a parent page with children | `replace_content` + carry child tags into `new_str` | See §7.2 |
 
-`update_content` is for local, well-targeted edits with an unambiguous `old_str`. Chaining 7+ `update_content` calls to delete sections that would fit in one `replace_content` rewrite is a smell — each call has overhead and adds one more chance for a Han variant code-point mismatch (§7.3) anywhere in the chain.
+`update_content` is for local, well-targeted edits with an unambiguous `old_str`. Chaining many `update_content` calls when one `replace_content` rewrite would do is a smell — each call has overhead, and on CJK content each call adds one more chance for a Han-variant code-point mismatch (§7.3).
 
 ### 7.1 Timeout ≠ failure
 
@@ -188,23 +201,18 @@ Large-payload writes (especially `update_content`) often return `notionhq_client
 
 ### 7.2 `replace_content` and child pages
 
-Child pages/databases are structural (§5.1), not part of the fetched markdown, so they are easy to forget on a parent page. `replace_content` errors rather than silently dropping them. To keep them, include the child `<page url="...">` / `<database url="...">` tags in `new_str`; to drop them, set `allow_deleting_content`. Before a `replace_content` on a parent page, fetch first and carry every child tag into `new_str` verbatim.
+Child pages/databases are structural (§5), not part of the fetched markdown, so they are easy to forget on a parent page. `replace_content` errors rather than silently dropping them. To keep them, include the child `<page url="...">` / `<database url="...">` tags in `new_str`; to drop them, set `allow_deleting_content`. Before a `replace_content` on a parent page, fetch first and carry every child tag into `new_str` verbatim.
 
 ### 7.3 `update_content` old_str must be copied verbatim from fetch
 
-The connector docs say to fetch first to get the snippets. The non-obvious failure mode: the LLM tends to retype from conversation memory or its own draft rather than copy verbatim from the fetch result. With Chinese content this fails silently because visually identical Han variants have different code points:
+The connector docs say to fetch first to get the snippets. The non-obvious failure mode: the LLM tends to retype from conversation memory or its own draft rather than copy verbatim from the fetch result. With CJK content this fails silently because visually similar Han variants have different code points:
 
-- 鏈 (U+93C8) vs 鍊 (U+930A) vs 鍗 (U+9357)
+- 鏈 (U+93C8) vs 鍊 (U+930A) — both render as "chain", different code points
+- 著 (U+8457) vs 着 (U+7740) — Traditional vs Simplified variant
 
-These produce `validation_error: No matches found`. When that error appears, **do not** start debugging the semantics or syntax of old_str — the root cause is almost always a code-point mismatch. Refetch, copy verbatim, and try again. If still failing, switch to `replace_content` (observing the §7.2 child-page caveat).
+These produce `validation_error: No matches found`. When that error appears, **do not** start debugging the semantics or syntax of `old_str` — the root cause is almost always a code-point mismatch. Refetch, copy verbatim, and try again. If still failing, switch to `replace_content` (observing the §7.2 child-page caveat).
 
-## 8. Multi-stage operations: keep the user oriented
-
-Building a database from scratch involves many turns: parent page, child page, schema, options, rows, index. Errors in mid-stage (DDL parser failure, option-name conflict) require backtracking.
-
-**Pattern**: at the start of each new stage, give the user a one-line summary of what completed in the previous stage and what the next stage will do. This costs almost nothing and prevents the user from losing the thread when they're reviewing a session days later.
-
-## 9. Error triage
+## 8. Error triage
 
 When a Notion MCP call fails or behaves unexpectedly, check this table first before re-reading docs or guessing.
 
@@ -212,14 +220,15 @@ When a Notion MCP call fails or behaves unexpectedly, check this table first bef
 |---|---|---|
 | `Expected column name in double quotes, got "("` | Option name contains `(` | §1.1 — replace `()` with `[]` or `-` |
 | STATUS create rejects inline options | DDL parser does not accept options for STATUS | §1.2 — use SELECT or empty STATUS |
-| `validation_error: No matches found` on `update_content` | Han variant code-point mismatch in `old_str` | §7.3 — refetch and copy verbatim |
+| `validation_error: No matches found` on `update_content` | Han-variant code-point mismatch in `old_str` | §7.3 — refetch and copy verbatim |
 | `notionhq_client_request_timeout` | Gateway timeout; write may have succeeded | §7.1 — fetch before retrying |
 | Multi-select write rejected | Option name not in schema, or literal array instead of JSON string | §3 |
 | Properties unchanged after `update_properties` | `content_updates` missing `[]`, or property name typo | §6.3 |
-| Child page block reappears at top of page after edit | Auto-rendered from parent-child relationship | §5.1 — not removable via content edit |
+| Child page block reappears at top of page after edit | Auto-rendered from parent-child relationship | §5 — not removable via content edit |
 | `<page url="...">` written inline ends up at top of page | Notion re-parses tag as child page reference | §2.1 — use markdown link syntax |
+| `update_content` succeeded but page now has duplicated content (old + new both present) | Fetch was stale; user edited the page in Notion app between your fetch and write | §6.4 — re-fetch before writing; remove the duplicate copy |
 
-## 10. Quick-reference: pre-flight checks before each tool call
+## 9. Quick-reference: pre-flight checks before each tool call
 
 Before calling, verify:
 
@@ -227,7 +236,9 @@ Before calling, verify:
 |---|---|
 | notion-create-database | No `(` `)` in option names. STATUS used without options or replaced by SELECT. |
 | notion-create-pages | parent is `data_source_id` (not database_id) for database rows. Multi-select values are JSON array strings. |
-| notion-update-page | content_updates passed as `[]` when not editing content. Property names match schema exactly. Content commands: large rewrite → `replace_content` (carry child `<page>`/`<database>` tags into new_str if the page has children, §7.2); small local edit → `update_content`. After timeout, fetch before retrying. |
+| notion-update-page (`update_properties`) | `content_updates` passed as `[]`. Property names match schema exactly. |
+| notion-update-page (`update_content`) | `old_str` copied verbatim from a recent fetch. Fetch is fresh per §6.4 (≤5 min old, no crossed user turn, or cold page). After a timeout, fetch before retrying. |
+| notion-update-page (`replace_content`) | If page has children, carry every child `<page>`/`<database>` tag into `new_str` verbatim (§7.2). |
 | notion-update-data-source | Same DDL limits as create-database. |
 | notion-fetch | `collection://` prefix for data sources, raw UUID for pages. |
-| notion-search | page_size ≤ 25. Don't expect to enumerate full databases this way. |
+| notion-search | `page_size` ≤ 25. Don't expect to enumerate full databases this way. |
