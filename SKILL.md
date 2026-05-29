@@ -170,7 +170,7 @@ Trade-off: one extra fetch call per write. But the duplication recovery path (fe
 
 ### 6.5 Write verification loop
 
-Required after any of: batch writes (>5 rows), `replace_content`, `update_content` after timeout.
+Required after any of: batch writes (>5 rows), `replace_content`, `update_content` after timeout, a single `update_content` call carrying 2+ `content_updates` (especially with CJK — see §7.3).
 
 1. Fetch a representative sample:
    - Batch writes: 2-3 random rows
@@ -227,6 +227,7 @@ When a Notion MCP call fails or behaves unexpectedly, check this table first bef
 | Child page block reappears at top of page after edit | Auto-rendered from parent-child relationship | §5 — not removable via content edit |
 | `<page url="...">` written inline ends up at top of page | Notion re-parses tag as child page reference | §2.1 — use markdown link syntax |
 | `update_content` succeeded but page now has duplicated content (old + new both present) | Fetch was stale; user edited the page in Notion app between your fetch and write | §6.4 — re-fetch before writing; remove the duplicate copy |
+| Multi-update `update_content` returns cleanly but verify shows one item never applied (no error) | Silent partial failure: one item's `old_str` did not match (code-point or whitespace/punctuation micro-diff) and was swallowed. Observed once (2026-05-26); connector batch-failure behaviour unconfirmed | §6.5 verify (a clean response ≠ every item landed); re-send that item alone, or switch to `replace_content` (§7) |
 
 ## 9. Quick-reference: pre-flight checks before each tool call
 
